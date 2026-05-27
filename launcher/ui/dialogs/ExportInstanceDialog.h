@@ -37,7 +37,11 @@
 #pragma once
 
 #include <QDialog>
+#include <QFileInfo>
+#include <QList>
 #include <QModelIndex>
+#include <QPair>
+#include <QStringList>
 #include <memory>
 #include "FastFileIconProvider.h"
 #include "FileIgnoreProxy.h"
@@ -60,6 +64,7 @@ class ExportInstanceDialog : public QDialog {
    private:
     void doExport();
     QString ignoreFileName();
+    QList<QPair<QString, QString>> collectOfflineFiles(QStringList& missingFiles);
 
    private:
     Ui::ExportInstanceDialog* m_ui;

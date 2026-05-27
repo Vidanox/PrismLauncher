@@ -56,8 +56,13 @@
 #include "net/ApiDownload.h"
 
 #include <QFileInfo>
+#include <QDir>
 #include <QtConcurrentRun>
 #include <memory>
+
+namespace {
+const QString OFFLINE_PAYLOAD_PATH = ".prismlauncher-offline";
+}
 
 InstanceImportTask::InstanceImportTask(const QUrl& sourceUrl, QWidget* parent, QMap<QString, QString>&& extra_info)
     : m_sourceUrl(sourceUrl), m_extra_info(extra_info), m_parent(parent)
@@ -341,6 +346,10 @@ void InstanceImportTask::processTechnic()
 
 void InstanceImportTask::processMultiMC()
 {
+    if (!installOfflinePayload()) {
+        return;
+    }
+
     QString configPath = FS::PathCombine(m_stagingPath, "instance.cfg");
     auto instanceSettings = std::make_unique<INISettingsObject>(configPath);
 
@@ -361,6 +370,49 @@ void InstanceImportTask::processMultiMC()
         installIcon(instance.instanceRoot(), m_instIcon);
     }
     emitSucceeded();
+}
+
+bool InstanceImportTask::installOfflinePayload()
+{
+    const QString payloadPath = FS::PathCombine(m_stagingPath, OFFLINE_PAYLOAD_PATH);
+    if (!QFileInfo::exists(payloadPath)) {
+        return true;
+    }
+
+    QString gameRoot = FS::PathCombine(m_stagingPath, "minecraft");
+    const QString dotMinecraftRoot = FS::PathCombine(m_stagingPath, ".minecraft");
+    if (QFileInfo::exists(dotMinecraftRoot) && !QFileInfo::exists(gameRoot)) {
+        gameRoot = dotMinecraftRoot;
+    }
+
+    struct PayloadMapping {
+        QString source;
+        QString destination;
+    };
+
+    const QList<PayloadMapping> mappings = {
+        { FS::PathCombine(payloadPath, "assets"), QDir("assets").absolutePath() },
+        { FS::PathCombine(payloadPath, "libraries"), QDir("libraries").absolutePath() },
+        { FS::PathCombine(payloadPath, "meta"), QDir("meta").absolutePath() },
+        { FS::PathCombine(payloadPath, "instance-resources"), FS::PathCombine(gameRoot, "resources") },
+    };
+
+    for (const auto& mapping : mappings) {
+        if (!QFileInfo::exists(mapping.source)) {
+            continue;
+        }
+        if (!FS::copy(mapping.source, mapping.destination).overwrite(true)()) {
+            emitFailed(tr("Failed to install offline game files from the exported instance."));
+            return false;
+        }
+    }
+
+    if (!FS::deletePath(payloadPath)) {
+        emitFailed(tr("Failed to remove temporary offline game files from the imported instance."));
+        return false;
+    }
+
+    return true;
 }
 
 void InstanceImportTask::processModrinth()

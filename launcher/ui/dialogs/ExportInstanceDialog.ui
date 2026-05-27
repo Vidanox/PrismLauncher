@@ -31,6 +31,13 @@
     </widget>
    </item>
    <item>
+    <widget class="QCheckBox" name="includeRuntimeFilesCheckBox">
+     <property name="text">
+      <string>Include Minecraft assets, libraries, and metadata for offline launch</string>
+     </property>
+    </widget>
+   </item>
+   <item>
     <widget class="QDialogButtonBox" name="buttonBox">
      <property name="orientation">
       <enum>Qt::Horizontal</enum>

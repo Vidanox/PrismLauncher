@@ -56,6 +56,7 @@ class InstanceImportTask : public InstanceTask {
     void processTechnic();
     void processFlame();
     void processModrinth();
+    bool installOfflinePayload();
 
    private slots:
     void processZipPack();

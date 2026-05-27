@@ -18,9 +18,11 @@
 #pragma once
 
 #include <QDir>
+#include <QFileInfo>
 #include <QFileInfoList>
 #include <QFuture>
 #include <QFutureWatcher>
+#include <QList>
 
 #include "archive/ArchiveWriter.h"
 #include "tasks/Task.h"
@@ -29,6 +31,11 @@ namespace MMCZip {
 class ExportToZipTask : public Task {
     Q_OBJECT
    public:
+    struct ExtraFile {
+        QString sourcePath;
+        QString destinationPath;
+    };
+
     ExportToZipTask(QString outputPath, QDir dir, QFileInfoList files, QString destinationPrefix = "", bool followSymlinks = false)
         : m_outputPath(outputPath)
         , m_output(outputPath)
@@ -46,6 +53,7 @@ class ExportToZipTask : public Task {
 
     void setExcludeFiles(QStringList excludeFiles) { m_excludeFiles = excludeFiles; }
     void addExtraFile(QString fileName, QByteArray data) { m_extraFiles.insert(fileName, data); }
+    void addExtraFile(QString sourcePath, QString destinationPath) { m_extraFilePaths.append({ sourcePath, destinationPath }); }
 
     using ZipResult = std::optional<QString>;
 
@@ -65,6 +73,7 @@ class ExportToZipTask : public Task {
     bool m_followSymlinks;
     QStringList m_excludeFiles;
     QHash<QString, QByteArray> m_extraFiles;
+    QList<ExtraFile> m_extraFilePaths;
 
     QFuture<ZipResult> m_buildZipFuture;
     QFutureWatcher<ZipResult> m_buildZipWatcher;

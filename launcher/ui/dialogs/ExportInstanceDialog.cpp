@@ -38,6 +38,8 @@
 #include "ExportInstanceDialog.h"
 #include <BaseInstance.h>
 #include <MMCZip.h>
+#include <QDirIterator>
+#include <QEventLoop>
 #include <QFileDialog>
 #include <QFileSystemModel>
 #include <QMessageBox>
@@ -54,11 +56,53 @@
 #include <QFileInfo>
 #include <QPushButton>
 #include <QSaveFile>
+#include <QSet>
 #include <QSortFilterProxyModel>
 #include <QStack>
 #include <functional>
 #include "Application.h"
 #include "SeparatorPrefixTree.h"
+#include "minecraft/AssetsUtils.h"
+#include "minecraft/LaunchProfile.h"
+#include "minecraft/MinecraftInstance.h"
+#include "minecraft/PackProfile.h"
+#include "tasks/Task.h"
+
+namespace {
+const QString OFFLINE_PAYLOAD_PATH = ".prismlauncher-offline/";
+
+void addExistingFile(QList<QPair<QString, QString>>& files, QSet<QString>& destinations, const QString& sourcePath, const QString& destination)
+{
+    QFileInfo info(sourcePath);
+    if (!info.isFile()) {
+        return;
+    }
+    if (destinations.contains(destination)) {
+        return;
+    }
+    destinations.insert(destination);
+    files.append({ info.absoluteFilePath(), destination });
+}
+
+QString normalizedRelativeFilePath(const QDir& root, const QString& path)
+{
+    return QDir::fromNativeSeparators(root.relativeFilePath(QFileInfo(path).absoluteFilePath()));
+}
+
+void addDirectoryFiles(QList<QPair<QString, QString>>& files, QSet<QString>& destinations, const QDir& root, const QString& prefix)
+{
+    if (!root.exists()) {
+        return;
+    }
+
+    QDirIterator it(root.absolutePath(), QDir::Files | QDir::Hidden, QDirIterator::Subdirectories);
+    while (it.hasNext()) {
+        auto sourcePath = it.next();
+        auto relativePath = normalizedRelativeFilePath(root, sourcePath);
+        addExistingFile(files, destinations, sourcePath, prefix + relativePath);
+    }
+}
+}  // namespace
 
 ExportInstanceDialog::ExportInstanceDialog(BaseInstance* instance, QWidget* parent)
     : QDialog(parent), m_ui(new Ui::ExportInstanceDialog), m_instance(instance)
@@ -90,6 +134,12 @@ ExportInstanceDialog::ExportInstanceDialog(BaseInstance* instance, QWidget* pare
 
     m_ui->buttonBox->button(QDialogButtonBox::Cancel)->setText(tr("Cancel"));
     m_ui->buttonBox->button(QDialogButtonBox::Ok)->setText(tr("OK"));
+
+    const auto minecraftInstance = qobject_cast<MinecraftInstance*>(m_instance);
+    m_ui->includeRuntimeFilesCheckBox->setEnabled(minecraftInstance);
+    m_ui->includeRuntimeFilesCheckBox->setToolTip(
+        tr("Adds the shared Minecraft assets, libraries, and metadata required by this instance so the imported instance can launch in "
+           "offline mode without downloading game files."));
 }
 
 ExportInstanceDialog::~ExportInstanceDialog()
@@ -153,6 +203,23 @@ void ExportInstanceDialog::doExport()
 
     auto task = makeShared<MMCZip::ExportToZipTask>(output, m_instance->instanceRoot(), files, "", true);
 
+    if (m_ui->includeRuntimeFilesCheckBox->isChecked()) {
+        QStringList missingFiles;
+        const auto offlineFiles = collectOfflineFiles(missingFiles);
+        if (!missingFiles.isEmpty()) {
+            QMessageBox::warning(
+                this, tr("Offline files missing"),
+                tr("Unable to export the instance for offline launch because some required files are missing:\n\n%1\n\nLaunch this "
+                   "instance once in online mode to download the missing files, then try exporting again.")
+                    .arg(missingFiles.join('\n')));
+            QDialog::done(QDialog::Rejected);
+            return;
+        }
+        for (const auto& [sourcePath, destinationPath] : offlineFiles) {
+            task->addExtraFile(sourcePath, destinationPath);
+        }
+    }
+
     connect(task.get(), &Task::failed, this,
             [this, output](QString reason) { CustomMessageBox::selectable(this, tr("Error"), reason, QMessageBox::Critical)->show(); });
     connect(task.get(), &Task::finished, this, [task] { task->deleteLater(); });
@@ -191,4 +258,148 @@ void ExportInstanceDialog::rowsInserted(QModelIndex parent, int top, int bottom)
 QString ExportInstanceDialog::ignoreFileName()
 {
     return FS::PathCombine(m_instance->instanceRoot(), ".packignore");
+}
+
+QList<QPair<QString, QString>> ExportInstanceDialog::collectOfflineFiles(QStringList& missingFiles)
+{
+    QList<QPair<QString, QString>> files;
+    QSet<QString> destinations;
+
+    auto minecraftInstance = qobject_cast<MinecraftInstance*>(m_instance);
+    if (!minecraftInstance) {
+        return files;
+    }
+
+    auto components = minecraftInstance->getPackProfile();
+    if (!components) {
+        missingFiles.append(tr("Instance components could not be loaded."));
+        return files;
+    }
+
+    if (auto result = components->reload(Net::Mode::Offline); !result) {
+        missingFiles.append(result.error);
+        return files;
+    }
+
+    auto metadataTask = components->getCurrentTask();
+    if (metadataTask) {
+        QEventLoop loop;
+        connect(metadataTask.get(), &Task::finished, &loop, &QEventLoop::quit);
+        loop.exec();
+        if (!metadataTask->wasSuccessful()) {
+            missingFiles.append(metadataTask->failReason());
+            return files;
+        }
+    }
+
+    auto profile = components->getProfile();
+    if (!profile) {
+        missingFiles.append(tr("Instance launch profile could not be loaded."));
+        return files;
+    }
+    if (profile->getProblemSeverity() == ProblemSeverity::Error) {
+        missingFiles.append(tr("Instance metadata is incomplete or invalid."));
+        return files;
+    }
+
+    QStringList libraryFiles;
+    profile->getLibraryFiles(minecraftInstance->runtimeContext(), libraryFiles, libraryFiles, minecraftInstance->getLocalLibraryPath(),
+                             minecraftInstance->binRoot(), false);
+    for (const auto& mavenFile : profile->getMavenFiles()) {
+        QStringList unusedFiles;
+        mavenFile->getApplicableFiles(minecraftInstance->runtimeContext(), libraryFiles, unusedFiles, unusedFiles, unusedFiles,
+                                      minecraftInstance->getLocalLibraryPath());
+    }
+    for (const auto& agent : profile->getAgents()) {
+        QStringList unusedFiles;
+        agent.library->getApplicableFiles(minecraftInstance->runtimeContext(), libraryFiles, unusedFiles, unusedFiles, unusedFiles,
+                                          minecraftInstance->getLocalLibraryPath());
+    }
+
+    const QDir libraryRoot(APPLICATION->metacache()->getBasePath("libraries"));
+    const QDir instanceLibraryRoot(minecraftInstance->getLocalLibraryPath());
+    for (const auto& filePath : libraryFiles) {
+        QFileInfo info(filePath);
+        if (!info.isFile()) {
+            missingFiles.append(filePath);
+            continue;
+        }
+
+        if (info.absoluteFilePath().startsWith(libraryRoot.absolutePath() + QDir::separator())) {
+            addExistingFile(files, destinations, info.absoluteFilePath(),
+                            OFFLINE_PAYLOAD_PATH + "libraries/" + normalizedRelativeFilePath(libraryRoot, info.absoluteFilePath()));
+        } else if (info.absoluteFilePath().startsWith(instanceLibraryRoot.absolutePath() + QDir::separator())) {
+            // Instance-local libraries are already part of the normal instance export.
+            continue;
+        } else {
+            missingFiles.append(filePath);
+        }
+    }
+
+    const QDir jarmodsRoot(minecraftInstance->jarmodsPath());
+    QStringList jarModFiles;
+    for (const auto& jarMod : profile->getJarMods()) {
+        QStringList unusedNativeFiles;
+        jarMod->getApplicableFiles(minecraftInstance->runtimeContext(), jarModFiles, unusedNativeFiles, unusedNativeFiles, unusedNativeFiles,
+                                   jarmodsRoot.absolutePath());
+    }
+    for (const auto& filePath : jarModFiles) {
+        if (!QFileInfo::exists(filePath)) {
+            missingFiles.append(filePath);
+        }
+    }
+
+    const auto assets = profile->getMinecraftAssets();
+    const QDir assetsRoot(QDir("assets").absolutePath());
+    const QString assetIndexPath = assetsRoot.absoluteFilePath("indexes/" + assets->id + ".json");
+    addExistingFile(files, destinations, assetIndexPath, OFFLINE_PAYLOAD_PATH + "assets/indexes/" + assets->id + ".json");
+    if (!QFileInfo::exists(assetIndexPath)) {
+        missingFiles.append(assetIndexPath);
+    } else {
+        AssetsIndex assetIndex;
+        if (!AssetsUtils::loadAssetsIndexJson(assets->id, assetIndexPath, assetIndex)) {
+            missingFiles.append(assetIndexPath);
+        } else {
+            for (auto asset : assetIndex.objects) {
+                const QString objectPath = assetsRoot.absoluteFilePath("objects/" + asset.getRelPath());
+                if (!QFileInfo::exists(objectPath)) {
+                    missingFiles.append(objectPath);
+                    continue;
+                }
+                addExistingFile(files, destinations, objectPath, OFFLINE_PAYLOAD_PATH + "assets/objects/" + asset.getRelPath());
+            }
+        }
+    }
+
+    if (AssetsIndex assetIndex; AssetsUtils::loadAssetsIndexJson(assets->id, assetIndexPath, assetIndex) && assetIndex.mapToResources) {
+        addDirectoryFiles(files, destinations, QDir(minecraftInstance->resourcesDir()), OFFLINE_PAYLOAD_PATH + "instance-resources/");
+    }
+
+    const QDir metaRoot(QDir("meta").absolutePath());
+    for (int i = 0; i < components->rowCount(); i++) {
+        const auto component = components->getComponent(i);
+        if (!component || component->isCustom()) {
+            continue;
+        }
+        const QString componentPath = component->getID() + "/" + component->getVersion() + ".json";
+        const QString sourcePath = metaRoot.absoluteFilePath(componentPath);
+        if (!QFileInfo::exists(sourcePath)) {
+            missingFiles.append(sourcePath);
+            continue;
+        }
+        addExistingFile(files, destinations, sourcePath, OFFLINE_PAYLOAD_PATH + "meta/" + componentPath);
+    }
+
+    const QStringList duplicateMissing = missingFiles;
+    missingFiles.clear();
+    QSet<QString> seenMissing;
+    for (const auto& path : duplicateMissing) {
+        if (path.isEmpty() || seenMissing.contains(path)) {
+            continue;
+        }
+        seenMissing.insert(path);
+        missingFiles.append(path);
+    }
+
+    return files;
 }

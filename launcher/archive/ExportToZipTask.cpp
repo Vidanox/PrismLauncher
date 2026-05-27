@@ -25,7 +25,7 @@ namespace MMCZip {
 void ExportToZipTask::executeTask()
 {
     setStatus("Adding files...");
-    setProgress(0, m_files.length());
+    setProgress(0, m_files.length() + m_extraFilePaths.length());
     m_buildZipFuture = QtConcurrent::run(QThreadPool::globalInstance(), [this]() { return exportZip(); });
     connect(&m_buildZipWatcher, &QFutureWatcher<ZipResult>::finished, this, &ExportToZipTask::finish);
     m_buildZipWatcher.setFuture(m_buildZipFuture);
@@ -45,6 +45,27 @@ auto ExportToZipTask::exportZip() -> ZipResult
             return ZipResult();
         if (!m_output.addFile(fileName, m_extraFiles[fileName])) {
             return ZipResult(tr("Could not add:") + fileName);
+        }
+    }
+
+    for (const ExtraFile& file : m_extraFilePaths) {
+        if (m_buildZipFuture.isCanceled())
+            return ZipResult();
+
+        setStatus("Compressing: " + file.destinationPath);
+        setProgress(m_progress + 1, m_progressTotal);
+
+        auto source = file.sourcePath;
+        if (m_followSymlinks) {
+            QFileInfo fileInfo(source);
+            if (fileInfo.isSymLink())
+                source = fileInfo.symLinkTarget();
+            else if (!fileInfo.canonicalFilePath().isEmpty())
+                source = fileInfo.canonicalFilePath();
+        }
+
+        if (!m_output.addFile(source, file.destinationPath)) {
+            return ZipResult(tr("Could not read and compress %1").arg(file.destinationPath));
         }
     }
 
